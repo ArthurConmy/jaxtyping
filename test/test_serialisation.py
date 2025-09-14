@@ -2,6 +2,8 @@ import pickle
 
 import cloudpickle
 import numpy as np
+import pytest
+from beartype import beartype
 
 
 try:
@@ -9,7 +11,7 @@ try:
 except ImportError:
     torch = None
 
-from jaxtyping import AbstractArray, Array, Float, Shaped
+from jaxtyping import AbstractArray, Array, Float, jaxtyped, Shaped
 
 
 def test_pickle():
@@ -33,3 +35,16 @@ def test_pickle():
             y = p.loads(x)
             assert y.dtype is Float
             assert y.dim_str == "batch length"
+
+
+def test_cloudpickle_jaxtyped():
+    @jaxtyped(typechecker=beartype)
+    def f(x: int) -> int:
+        return x + 1
+
+    pickled_f = cloudpickle.dumps(f)
+    unpickled_f = cloudpickle.loads(pickled_f)
+
+    assert unpickled_f(1) == 2
+    with pytest.raises(Exception):
+        unpickled_f("a")

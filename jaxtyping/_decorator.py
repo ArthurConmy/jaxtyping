@@ -21,9 +21,11 @@ import dataclasses
 import functools as ft
 import inspect
 import itertools as it
+import pickle
 import sys
 import warnings
 import weakref
+import copyreg
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from typing import (
@@ -51,6 +53,48 @@ _T = TypeVar("_T")
 # Not `TypeVar(..., type, Callable)` as else the output type of our first overload is
 # just `type`, and not the particular class that is decorated.
 _TypeOrCallable = TypeVar("_TypeOrCallable", bound=Union[type, Callable])
+
+
+class _PicklableWeakRef:
+    def __init__(self, obj):
+        self._ref = weakref.ref(obj)
+
+    def __call__(self):
+        return self._ref()
+
+
+def _state_setter(container, wrapped_fn):
+    container._ref = weakref.ref(wrapped_fn)
+
+
+def _unpickle_constructor():
+    container = _PicklableWeakRef.__new__(_PicklableWeakRef)
+    container._ref = None
+    return container
+
+
+def _reducer(container: _PicklableWeakRef):
+    wrapped_fn = container()
+    if wrapped_fn is None:
+        raise pickle.PicklingError(
+            "Cannot pickle a jaxtyped function with a dead weak reference."
+        )
+    return (_unpickle_constructor, (), wrapped_fn, None, None, _state_setter)
+
+
+copyreg.pickle(_PicklableWeakRef, _reducer)
+
+
+try:
+    from typeguard._utils import FrameLocalsProxy
+except ImportError:
+    FrameLocalsProxy = None
+
+if FrameLocalsProxy is not None:
+    # Make typeguard's FrameLocalsProxy pickleable.
+    # It's just used to look up stringified annotations, so it's safe to just ditch
+    # it when pickling.
+    copyreg.pickle(FrameLocalsProxy, lambda p: (dict, ()))
 
 
 class _Sentinel:
@@ -542,27 +586,16 @@ def jaxtyped(fn=_sentinel, *, typechecker=_sentinel):
                 def __setstate__(self, state):
                     self._ref = None
 
-            wrapped_fn_holder = _PickleableWeakRefHolder()
+            wrapped_fn_ref_holder = []
 
             @ft.wraps(fn)
             def wrapped_fn(*args, **kwargs):
                 __tracebackhide__ = True
 
-                if wrapped_fn_holder._ref is None:
-                    # Lazily set the weakref. This is important for pickling, as
-                    # upon unpickling, the weakref will be gone.
-                    wrapped_fn_holder.set(wrapped_fn)
-
-                wrapped_fn_instance = wrapped_fn_holder()
-                no_type_check_on_self = (
-                    wrapped_fn_instance is not None
-                    and getattr(wrapped_fn_instance, "__no_type_check__", False)
-                )
-
                 if (
                     config.jaxtyping_disable
                     or getattr(fn, "__no_type_check__", False)
-                    or no_type_check_on_self
+                    or getattr(wrapped_fn_ref_holder[0](), "__no_type_check__", False)
                 ):
                     return fn(*args, **kwargs)
 
@@ -578,6 +611,8 @@ def jaxtyped(fn=_sentinel, *, typechecker=_sentinel):
                     return wrapped_fn_impl(args, kwargs, bound, memos)
                 finally:
                     pop_shape_memo()
+
+            wrapped_fn_ref_holder.append(_PicklableWeakRef(wrapped_fn))
 
         return wrapped_fn
 
