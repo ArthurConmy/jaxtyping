@@ -73,7 +73,7 @@ def test_jaxtyped_cloudpickle(typechecker_lib):
 
     # Define a function locally to ensure cloudpickle handles the closure.
     @jaxtyped(typechecker=typechecker)
-    def local_typechecked_fn(x: Float[np.ndarray, " d"]) -> float:
+    def local_typechecked_fn(x: Float[np.ndarray, "d"]) -> float:
         # Use np.sum() to ensure numpy interaction works
         return float(np.sum(x))
 
