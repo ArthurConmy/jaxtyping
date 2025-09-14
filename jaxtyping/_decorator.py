@@ -468,14 +468,6 @@ def jaxtyped(fn=_sentinel, *, typechecker=_sentinel):
             # ```
             # in which case we can do a better job reporting errors.
 
-            # TODO(b/396119644): this is a workaround for compatiblity
-            # issues between typeguard 4.4.2 and jaxtyping.
-            if (
-                "typeguard" in sys.modules
-                and typechecker == sys.modules["typeguard"].typechecked
-            ):
-                typechecker = ft.partial(typechecker, disable_instrumentation=True)
-
             full_signature = inspect.signature(fn)
             try:
                 destring_annotations = get_type_hints(fn, include_extras=True)
