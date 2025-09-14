@@ -524,16 +524,45 @@ def jaxtyped(fn=_sentinel, *, typechecker=_sentinel):
 
                 return out
 
-            wrapped_fn_holder = []  # Avoids introducing a reference cycle.
+            class _PickleableWeakRefHolder:
+                def __init__(self):
+                    self._ref = None
+
+                def __call__(self):
+                    if self._ref is None:
+                        return None
+                    return self._ref()
+
+                def set(self, obj):
+                    self._ref = weakref.ref(obj)
+
+                def __getstate__(self):
+                    return None
+
+                def __setstate__(self, state):
+                    self._ref = None
+
+            wrapped_fn_holder = _PickleableWeakRefHolder()
 
             @ft.wraps(fn)
             def wrapped_fn(*args, **kwargs):
                 __tracebackhide__ = True
 
+                if wrapped_fn_holder._ref is None:
+                    # Lazily set the weakref. This is important for pickling, as
+                    # upon unpickling, the weakref will be gone.
+                    wrapped_fn_holder.set(wrapped_fn)
+
+                wrapped_fn_instance = wrapped_fn_holder()
+                no_type_check_on_self = (
+                    wrapped_fn_instance is not None
+                    and getattr(wrapped_fn_instance, "__no_type_check__", False)
+                )
+
                 if (
                     config.jaxtyping_disable
                     or getattr(fn, "__no_type_check__", False)
-                    or getattr(wrapped_fn_holder[0](), "__no_type_check__", False)
+                    or no_type_check_on_self
                 ):
                     return fn(*args, **kwargs)
 
@@ -549,8 +578,6 @@ def jaxtyped(fn=_sentinel, *, typechecker=_sentinel):
                     return wrapped_fn_impl(args, kwargs, bound, memos)
                 finally:
                     pop_shape_memo()
-
-            wrapped_fn_holder.append(weakref.ref(wrapped_fn))
 
         return wrapped_fn
 
