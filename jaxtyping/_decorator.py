@@ -17,11 +17,14 @@
 # IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+import copyreg
 import dataclasses
 import functools as ft
+import importlib.util
 import inspect
 import itertools as it
 import sys
+import wadler_lindig
 import warnings
 import weakref
 from collections.abc import Callable
@@ -29,6 +32,7 @@ from contextlib import AbstractContextManager
 from typing import (
     Any,
     get_args,
+    get_origin,
     get_type_hints,
     Literal,
     NoReturn,
@@ -62,6 +66,66 @@ _sentinel = _Sentinel()
 _tb_flag = True
 
 
+# --- Serialization helpers for pickling support (e.g. cloudpickle) ---
+# See https://github.com/patrick-kidger/jaxtyping/issues/343
+# and https://github.com/patrick-kidger/jaxtyping/issues/332
+
+class _SelfRefContainer:
+    """Container for a weak reference to an object (typically a function).
+
+    This is designed to be picklable (e.g. by cloudpickle), even when the container
+    is part of the closure of the object it references. It uses the extended reduce
+    protocol (PEP 307) to delay weak reference creation until deserialization.
+    """
+    __slots__ = ("ref",)
+
+    def __init__(self):
+        # Initialize without a reference.
+        self.ref: weakref.ReferenceType | None = None
+
+    def set_ref(self, obj):
+        self.ref = weakref.ref(obj)
+
+    def __call__(self):
+        # Mimics the behavior of calling a weakref object.
+        if self.ref is None:
+            return None
+        return self.ref()
+
+def _make_self_ref_container():
+    # Constructor for unpickling
+    return _SelfRefContainer()
+
+def _self_ref_container_set_state(container: _SelfRefContainer, state):
+    # State setter for unpickling.
+    # 'state' is expected to be the object we want to reference.
+    # If state is None, it means the original reference was dead or unset.
+    if state is not None:
+        container.set_ref(state)
+
+def _reduce_self_ref_container(container: _SelfRefContainer):
+    # Extended reduce implementation.
+    reconstructor = _make_self_ref_container
+    args = ()
+    
+    # We serialize the target object itself. The pickler handles memoization
+    # for the circular dependency.
+    referenced_obj = container()
+    state = referenced_obj
+    
+    # We use the 6-tuple format for extended reduce protocol.
+    # (callable, args, state, iter_list, iter_dict, setter)
+    # The setter will be called as setter(obj, state) during unpickling.
+    state_setter = _self_ref_container_set_state
+
+    return (reconstructor, args, state, None, None, state_setter)
+
+# Register the reducer with copyreg, which pickle and cloudpickle use.
+copyreg.pickle(_SelfRefContainer, _reduce_self_ref_container)
+
+# --- End of serialization helpers ---
+
+
 def _apply_typechecker(typechecker, fn):
     """Calls `typechecker(fn)` in an isolated frame, returning the result.
 
@@ -88,14 +152,9 @@ def jaxtyped(
 ) -> Callable[_Params, _Return]: ...
 
 
-@overload
-def jaxtyped(fn: Literal["context"]) -> AbstractContextManager[None]: ...
-
-
 def jaxtyped(fn=_sentinel, *, typechecker=_sentinel):
     """Decorate a function with this to perform runtime type-checking of its arguments
-    and return value. Decorate a dataclass to perform type-checking of its `__init__`
-    method.
+    and return value. Decorate a dataclass to perform type-checking of its attributes.
 
     !!! Example
 
@@ -233,10 +292,9 @@ def jaxtyped(fn=_sentinel, *, typechecker=_sentinel):
     if _tb_flag:
         try:
             import jax._src.traceback_util as traceback_util
-        except Exception:
-            pass
-        else:
             traceback_util.register_exclusion(__file__)
+        except:
+            pass
         _tb_flag = False
 
     # First handle the `jaxtyped("context")` usage, which is a special case.
@@ -294,14 +352,34 @@ def jaxtyped(fn=_sentinel, *, typechecker=_sentinel):
         return ft.partial(jaxtyped, typechecker=typechecker)
     elif inspect.isclass(fn):
         if dataclasses.is_dataclass(fn) and typechecker is not None:
-            try:
-                already_wrapped = fn.__init__.__globals__["__name__"] == __name__
-            except (AttributeError, KeyError):
-                pass
-            else:
-                if already_wrapped:
-                    return fn
-            fn.__init__ = jaxtyped(fn.__init__, typechecker=typechecker)
+            # This does not check that the arguments passed to `__init__` match the
+            # type annotations. There may be a custom user `__init__`, or a
+            # dataclass-generated `__init__` used alongside
+            # `equinox.field(converter=...)`
+
+            init = fn.__init__
+
+            @ft.wraps(init)
+            def __init__(self, *args, **kwargs):
+                __tracebackhide__ = True
+                init(self, *args, **kwargs)
+                # `fn.__init__` is late-binding to the `__init__` function that
+                # we're in now. (Or to someone else's monkey-patch.) Either way,
+                # this checks that we're in the "top-level" `__init__`, and not one
+                # that is being called via `super()`. We don't want to trigger too
+                # early, before all fields have been assigned.
+                #
+                # We're not checking `if self.__class__ is fn` because Equinox
+                # replaces the with a defrozen version of itself during `__init__`,
+                # so the check wouldn't trigger.
+                #
+                # We're not doing this check by adding it to the end of the
+                # metaclass `__call__`, because Python doesn't allow you
+                # monkey-patch metaclasses.
+                if self.__class__.__init__ is fn.__init__:
+                    _check_dataclass_annotations(self, typechecker)
+
+            fn.__init__ = __init__
         return fn
     # It'd be lovely if we could handle arbitrary descriptors, and not just the builtin
     # ones. Unfortunately that means returning a class instance with a __get__ method,
@@ -390,15 +468,19 @@ def jaxtyped(fn=_sentinel, *, typechecker=_sentinel):
             # ```
             # in which case we can do a better job reporting errors.
 
+            # TODO(b/396119644): this is a workaround for compatiblity
+            # issues between typeguard 4.4.2 and jaxtyping.
+            if (
+                "typeguard" in sys.modules
+                and typechecker == sys.modules["typeguard"].typechecked
+            ):
+                typechecker = ft.partial(typechecker, disable_instrumentation=True)
+
             full_signature = inspect.signature(fn)
             try:
                 destring_annotations = get_type_hints(fn, include_extras=True)
-            except Exception:
+            except NameError:
                 # Best-effort attempt to destringify annotations.
-                # Not just `NameError` but also e.g. `ValueError` in case we have e.g.
-                # 'Float[Foo, "*foo *bar"]' and raise  from having multiple variadic
-                # arguments. Sometimes this can still be useful to use for human
-                # documentation purposes.
                 pass
             else:
                 new_params = []
@@ -524,7 +606,9 @@ def jaxtyped(fn=_sentinel, *, typechecker=_sentinel):
 
                 return out
 
-            wrapped_fn_holder = []  # Avoids introducing a reference cycle.
+            # wrapped_fn_holder = []  # Avoids introducing a reference cycle.
+            # Use a picklable container to avoid reference cycles and allow pickling.
+            wrapped_fn_holder = _SelfRefContainer()
 
             @ft.wraps(fn)
             def wrapped_fn(*args, **kwargs):
@@ -533,7 +617,8 @@ def jaxtyped(fn=_sentinel, *, typechecker=_sentinel):
                 if (
                     config.jaxtyping_disable
                     or getattr(fn, "__no_type_check__", False)
-                    or getattr(wrapped_fn_holder[0](), "__no_type_check__", False)
+                    # or getattr(wrapped_fn_holder[0](), "__no_type_check__", False)
+                    or getattr(wrapped_fn_holder(), "__no_type_check__", False)
                 ):
                     return fn(*args, **kwargs)
 
@@ -550,7 +635,9 @@ def jaxtyped(fn=_sentinel, *, typechecker=_sentinel):
                 finally:
                     pop_shape_memo()
 
-            wrapped_fn_holder.append(weakref.ref(wrapped_fn))
+            # wrapped_fn_holder.append(weakref.ref(wrapped_fn))
+            # Initialize the weak reference in the container.
+            wrapped_fn_holder.set_ref(wrapped_fn)
 
         return wrapped_fn
 
@@ -561,6 +648,54 @@ class _JaxtypingContext:
 
     def __exit__(self, exc_type, exc_value, exc_tb):
         pop_shape_memo()
+
+
+def _check_dataclass_annotations(self, typechecker):
+    """Creates and calls a function that checks the attributes of `self`
+
+    `self` should be a dataclass instance. `typechecker` should be e.g.
+    `beartype.beartype` or `typeguard.typechecked`.
+    """
+    parameters = [inspect.Parameter("self", inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+    values = {}
+    for field in dataclasses.fields(self):
+        annotation = field.type
+        if isinstance(annotation, str):
+            # Don't check stringified annotations. These are basically impossible to
+            # resolve correctly, so just skip them.
+            continue
+        if get_origin(annotation) is type:
+            args = get_args(annotation)
+            if len(args) == 1 and isinstance(args[0], str):
+                # We also special-case this one kind of partially-stringified type
+                # annotation, so as to support Equinox <v0.11.1.
+                # This was fixed in Equinox in
+                # https://github.com/patrick-kidger/equinox/pull/543
+                continue
+        try:
+            value = getattr(self, field.name)  # noqa: F841
+        except AttributeError:
+            continue  # allow uninitialised fields, which are allowed on dataclasses
+
+        parameters.append(
+            inspect.Parameter(
+                field.name,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                annotation=field.type,
+            )
+        )
+        values[field.name] = value
+
+    signature = inspect.Signature(parameters)
+    f = _make_fn_with_signature(
+        self.__class__.__name__,
+        self.__class__.__qualname__,
+        self.__class__.__module__,
+        signature,
+        output=False,
+    )
+    f = jaxtyped(f, typechecker=typechecker)
+    f(self, **values)
 
 
 def _make_fn_with_signature(
@@ -778,39 +913,23 @@ def _remove_typing(x):
 def _pformat(x, short_self: bool):
     # No performance concerns from delayed imports -- this is only used when we're about
     # to raise an error anyway.
-    try:
-        # If we can, use `eqx.tree_pformat`, which wraps `wadler_lindig.pformat` with
-        # understanding of a few other JAX-specific things.
-        import equinox as eqx
 
-        pformat = eqx.tree_pformat
+    # Failing that fall back to `wadler_lindig.pformat` directly.
 
-        if short_self:
-            try:
-                self = x["self"]
-            except KeyError:
-                pass
-            else:
-                is_self = lambda y: y is self
-                pformat = ft.partial(pformat, truncate_leaf=is_self)
-    except Exception:
-        # Failing that fall back to `wadler_lindig.pformat` directly.
-        import wadler_lindig
+    pformat = wadler_lindig.pformat
 
-        pformat = wadler_lindig.pformat
+    if short_self:
+        try:
+            self = x["self"]
+        except KeyError:
+            pass
+        else:
 
-        if short_self:
-            try:
-                self = x["self"]
-            except KeyError:
-                pass
-            else:
+            def custom(obj):
+                if obj is self:
+                    return wadler_lindig.TextDoc(f"{type(obj).__name__}(...)")
 
-                def custom(obj):
-                    if obj is self:
-                        return wadler_lindig.TextDoc(f"{type(obj).__name__}(...)")
-
-                pformat = ft.partial(pformat, custom=custom)
+            pformat = ft.partial(pformat, custom=custom)
     try:
         return pformat(x)
     except Exception:
