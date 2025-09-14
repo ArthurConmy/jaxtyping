@@ -60,3 +60,4 @@ Available at [https://docs.kidger.site/jaxtyping](https://docs.kidger.site/jaxty
 
 **Awesome JAX**  
 [Awesome JAX](https://github.com/n2cholas/awesome-jax): a longer list of other JAX projects.  
+change made by Gemini CLI in order to put up a future PR
